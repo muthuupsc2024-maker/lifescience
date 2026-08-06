@@ -1,0 +1,12 @@
+db:
+  host: "localhost"
+  port: "5432"
+  user: "postgres"
+  password: "Admin1234"
+  database: "postgres"
+
+sfdc:
+  username: "muthumuthu225_x3bjocrx0wtol@gmail.com"
+  password: "Muthu@2026"
+  token: "5FRinRHOcdNmMIP3drwPIn2j"
+  authUrl: "https://login.salesforce.com/services/OAuth2/token"

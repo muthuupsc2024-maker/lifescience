@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+		http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+	<!-- 1. Configuration Properties -->
+	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
+
+	<!-- 2. HTTP Listener Config (Port 8081) -->
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+
+	<!-- 3. PostgreSQL Database Connection Config -->
+	<db:config name="PostgreSQL_Config" doc:name="Database Config">
+		<db:generic-connection 
+			url="jdbc:postgresql://${db.host}:${db.port}/${db.database}" 
+			driverClassName="org.postgresql.Driver" 
+			user="${db.user}" 
+			password="${db.password}" />
+	</db:config>
+
+	<!-- 4. Salesforce Life Sciences Cloud Org Config (muthulifescience) -->
+	<salesforce:sfdc-config name="Salesforce_MuthuLifeScience_Config" doc:name="Salesforce Config">
+		<salesforce:basic-connection 
+			username="${sfdc.username}" 
+			password="${sfdc.password}" 
+			securityToken="${sfdc.token}" 
+			url="${sfdc.authUrl}" />
+	</salesforce:sfdc-config>
+
+	<!-- ========================================================================= -->
+	<!-- FLOW 1: PostgreSQL ➔ MuleSoft DataWeave ➔ Salesforce LSC Sync Flow       -->
+	<!-- ========================================================================= -->
+	<flow name="postgres-to-salesforce-lifescience-sync-flow" doc:id="sync-flow-001">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/sync-db"/>
+		
+		<logger level="INFO" doc:name="Log Sync Trigger" message="[MuleSoft LSC] Triggering PostgreSQL Hospital Patient Labs Sync to Salesforce muthulifescience org..." />
+		
+		<!-- Step 1: Select new patient lab records from PostgreSQL database -->
+		<db:select doc:name="Select NEW Hospital Labs from PostgreSQL" config-ref="PostgreSQL_Config">
+			<db:sql><![CDATA[
+				SELECT lab_id, patient_external_id, patient_full_name, test_code, numeric_value, unit_of_measure, result_status, recorded_at
+				FROM hospital_patient_labs
+				WHERE sync_status = 'NEW';
+			]]></db:sql>
+		</db:select>
+		
+		<logger level="INFO" doc:name="Log Query Results" message="#['[MuleSoft LSC] Found ' ++ sizeOf(payload) ++ ' new patient lab records in PostgreSQL']"/>
+		
+		<choice doc:name="Choice Has New Labs">
+			<when expression="#[sizeOf(payload) > 0]">
+				<!-- Step 2: Store original lab list in variable -->
+				<set-variable value="#[payload]" doc:name="Set Variable postgresLabs" variableName="postgresLabs"/>
+				
+				<!-- Step 3: Transform PostgreSQL Rows ➔ FHIR R4 JSON & Salesforce CareObservation SObject Payload -->
+				<ee:transform doc:name="DataWeave 2.0: SQL Rows to Salesforce CareObservation">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload map ( labRow ) -> {
+	"Name": "FHIR R4 Observation: " ++ (labRow.test_code default "Biomarker Telemetry"),
+	"ObservedSubjectId": labRow.patient_external_id,
+	"NumericValue": labRow.numeric_value as Number,
+	"ObservedValueText": (labRow.numeric_value as String) ++ " " ++ (labRow.unit_of_measure default "ng/mL"),
+	"ObservationStatus": if (upper(labRow.result_status) == "FINAL") "Final" else "Preliminary",
+	"Category": "Laboratory",
+	"SourceSystem": "Epic EHR - MuleSoft Direct PostgreSQL Pipeline",
+	"SourceSystemIdentifier": labRow.lab_id
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+				
+				<!-- Step 4: Create CareObservation Records in Salesforce muthulifescience org -->
+				<salesforce:create doc:name="Create CareObservation in Salesforce" config-ref="Salesforce_MuthuLifeScience_Config" type="CareObservation"/>
+				
+				<logger level="INFO" doc:name="Log Salesforce Creation Result" message="#['[MuleSoft LSC] Salesforce Create Result: ' ++ write(payload, 'application/json')]"/>
+				
+				<!-- Step 5: Update PostgreSQL database setting sync_status = 'PROCESSED' -->
+				<foreach doc:name="For Each Processed Lab" collection="#[vars.postgresLabs]">
+					<db:update doc:name="Update PostgreSQL sync_status" config-ref="PostgreSQL_Config">
+						<db:sql><![CDATA[
+							UPDATE hospital_patient_labs
+							SET sync_status = 'PROCESSED'
+							WHERE lab_id = :labId;
+						]]></db:sql>
+						<db:input-parameters><![CDATA[#[{
+							labId: payload.lab_id
+						}]]]></db:input-parameters>
+					</db:update>
+				</foreach>
+				
+				<ee:transform doc:name="Format Final JSON Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"status": "SUCCESS",
+	"message": "Successfully synchronized patient lab data from PostgreSQL to Salesforce Life Sciences Cloud (muthulifescience)",
+	"recordsProcessed": sizeOf(vars.postgresLabs),
+	"salesforceResult": payload
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</when>
+			<otherwise>
+				<ee:transform doc:name="Format Empty Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"status": "NO_DATA",
+	"message": "No new patient lab records found in PostgreSQL (sync_status = 'NEW')"
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+	</flow>
+
+	<!-- ========================================================================= -->
+	<!-- FLOW 2: Direct HL7 FHIR R4 Observation HTTP REST API Gateway Endpoint    -->
+	<!-- ========================================================================= -->
+	<flow name="fhir-r4-observation-http-gateway-flow" doc:id="gateway-flow-002">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/observation"/>
+		
+		<logger level="INFO" doc:name="Log Inbound FHIR Payload" message="#['[MuleSoft FHIR Gateway] Inbound HL7 FHIR R4 Observation Payload received: ' ++ write(payload, 'application/json')]"/>
+		
+		<!-- Transform Inbound HL7 FHIR R4 JSON ➔ Salesforce CareObservation SObject -->
+		<ee:transform doc:name="DataWeave 2.0: FHIR R4 JSON to Salesforce CareObservation">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	"Name": "FHIR R4 Observation: " ++ (payload.code.text default "Biomarker Telemetry"),
+	"ObservedSubjectId": (payload.subject.reference replace "Patient/" with ""),
+	"NumericValue": payload.valueQuantity.value as Number,
+	"ObservedValueText": (payload.valueQuantity.value as String) ++ " " ++ (payload.valueQuantity.unit default "ng/mL"),
+	"ObservationStatus": if (lower(payload.status) == "final") "Final" else "Preliminary",
+	"Category": if (payload.category[0].coding[0].code == "vital-signs") "Vital Signs" else "Laboratory",
+	"SourceSystem": "Epic EHR - MuleSoft Direct Gateway",
+	"SourceSystemIdentifier": payload.id
+}]]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<salesforce:create doc:name="Create CareObservation in Salesforce" config-ref="Salesforce_MuthuLifeScience_Config" type="CareObservation"/>
+		
+		<ee:transform doc:name="Format FHIR Gateway Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"resourceType": "OperationOutcome",
+	"issue": [{
+		"severity": "information",
+		"code": "informational",
+		"diagnostics": "Successfully ingested FHIR R4 Observation into Salesforce Life Sciences Cloud (muthulifescience)",
+		"salesforceResult": payload
+	}]
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+</mule>
