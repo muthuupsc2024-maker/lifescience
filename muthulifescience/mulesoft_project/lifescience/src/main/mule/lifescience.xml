@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+		http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+	<!-- 1. Configuration Properties -->
+	<configuration-properties doc:name="Configuration properties" file="config.yaml" />
+
+	<!-- 2. HTTP Listener Config (Port 8081) -->
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+
+	<!-- 3. PostgreSQL Database Connection Config -->
+	<db:config name="PostgreSQL_Config" doc:name="Database Config">
+		<db:generic-connection 
+			url="jdbc:postgresql://${db.host}:${db.port}/${db.database}" 
+			driverClassName="org.postgresql.Driver" 
+			user="${db.user}" 
+			password="${db.password}" />
+	</db:config>
+
+	<!-- 4. Salesforce Life Sciences Cloud Org Config (muthulifescience) -->
+	<salesforce:sfdc-config name="Salesforce_MuthuLifeScience_Config" doc:name="Salesforce Config">
+		<salesforce:basic-connection 
+			username="${sfdc.username}" 
+			password="${sfdc.password}" 
+			securityToken="${sfdc.token}" 
+			url="${sfdc.authUrl}" />
+	</salesforce:sfdc-config>
+
+	<!-- ========================================================================= -->
+	<!-- USE CASE 1: Clinical Trial ER Admissions Sync (ClinicalEncounter)        -->
+	<!-- ========================================================================= -->
+	<flow name="usecase-1-clinical-encounter-sync-flow" doc:id="uc1-flow">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/encounter"/>
+		<logger level="INFO" doc:name="Log UC1" message="[MuleSoft UC1] Processing Inpatient Clinical Encounter payload into Salesforce..." />
+		
+		<ee:transform doc:name="DataWeave: FHIR Encounter ➔ ClinicalEncounter">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	"PatientId": payload.patient_external_id default "001f600000aSy4YAAS",
+	"Category": payload.category default "Inpatient",
+	"Status": payload.status default "Finished",
+	"SourceSystem": "Cerner EHR - MuleSoft Direct Connector",
+	"SourceSystemIdentifier": payload.encounter_id default "ENC-2026-9901"
+}]]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<salesforce:create doc:name="Create ClinicalEncounter" config-ref="Salesforce_MuthuLifeScience_Config" type="ClinicalEncounter"/>
+		
+		<ee:transform doc:name="Response UC1">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"useCase": "1. Clinical Trial ER Admission Sync",
+	"status": "SUCCESS",
+	"salesforceResult": payload
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ========================================================================= -->
+	<!-- USE CASE 2: Cell & Gene Therapy CAR-T Slot Sync (WorkOrder / Custody)     -->
+	<!-- ========================================================================= -->
+	<flow name="usecase-2-cell-therapy-scheduling-flow" doc:id="uc2-flow">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/cell-therapy"/>
+		<logger level="INFO" doc:name="Log UC2" message="[MuleSoft UC2] Processing Cell Therapy Apheresis Scheduling payload into Salesforce..." />
+		
+		<ee:transform doc:name="DataWeave: FHIR Procedure ➔ WorkOrder">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	"Subject": payload.subject_description default "Apheresis Cell Collection - Mayo Clinic",
+	"Status": payload.status default "In Progress",
+	"Description": "Vein-to-Vein Apheresis Collection booked via MuleSoft Direct ATM Connector"
+}]]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<salesforce:create doc:name="Create WorkOrder" config-ref="Salesforce_MuthuLifeScience_Config" type="WorkOrder"/>
+		
+		<ee:transform doc:name="Response UC2">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"useCase": "2. Cell & Gene Therapy (CAR-T) Slot Sync",
+	"status": "SUCCESS",
+	"salesforceResult": payload
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ========================================================================= -->
+	<!-- USE CASE 3: MedTech Surgical Device Scan Sync (Asset)                     -->
+	<!-- ========================================================================= -->
+	<flow name="usecase-3-medtech-implant-sync-flow" doc:id="uc3-flow">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/medtech-implant"/>
+		<logger level="INFO" doc:name="Log UC3" message="[MuleSoft UC3] Processing MedTech Surgical Device Scan into Salesforce Asset..." />
+		
+		<ee:transform doc:name="DataWeave: FHIR Device ➔ Asset">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	"Id": payload.asset_id default "02if6000002BqQLAA0",
+	"Status": payload.status default "Purchased",
+	"SerialNumber": payload.serial_number default "UDI-SN-2026-9871"
+}]]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<salesforce:update doc:name="Update MedTech Asset" config-ref="Salesforce_MuthuLifeScience_Config" type="Asset"/>
+		
+		<ee:transform doc:name="Response UC3">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"useCase": "3. MedTech Surgical Device Implant Sync",
+	"status": "SUCCESS",
+	"salesforceResult": payload
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ========================================================================= -->
+	<!-- USE CASE 4: Specialty Prescription Intake & Care Program Enrollee Sync   -->
+	<!-- ========================================================================= -->
+	<flow name="usecase-4-specialty-rx-intake-flow" doc:id="uc4-flow">
+		<http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/api/v1/fhir/prescription"/>
+		<logger level="INFO" doc:name="Log UC4" message="[MuleSoft UC4] Processing Specialty Rx Intake into CareProgramEnrollee..." />
+		
+		<ee:transform doc:name="DataWeave: FHIR MedicationRequest ➔ CareProgramEnrollee">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	"Name": "Care Program Enrollee - Alex Johnson",
+	"AccountId": payload.patient_external_id default "001f600000aSy4YAAS",
+	"CareProgramId": payload.care_program_id default "0Zef60000009QjFCAU",
+	"Status": payload.status default "Pending Eligibility",
+	"SourceSystem": "Epic EHR - MuleSoft Rx Direct Intake"
+}]]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<salesforce:create doc:name="Create CareProgramEnrollee" config-ref="Salesforce_MuthuLifeScience_Config" type="CareProgramEnrollee"/>
+		
+		<ee:transform doc:name="Response UC4">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	"useCase": "4. Specialty Rx Intake & Care Program Enrollment",
+	"status": "SUCCESS",
+	"salesforceResult": payload
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+</mule>
